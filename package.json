@@ -5,7 +5,11 @@
   "scripts": {
     "dev": "node server.js",
     "start": "node server.js",
-    "build": "node -e \"console.log('Build completed')\""
+    "build": "node -e \"console.log('Build completed')\"",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
   },
   "dependencies": {}
 }
