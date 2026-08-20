@@ -1,0 +1,6 @@
+{
+  "name": "API-v2 Stream Player",
+  "description": "Direct stream player and bypass API proxy for Cloudflare Workers",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

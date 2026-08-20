@@ -332,22 +332,29 @@ export default {
             let originalStreamingUrl = "";
 
             try {
-                // Step 1: Check the D1 cache FIRST. If we already parsed this video's
+                // Step 1: Check the D1 cache FIRST (external_direct_links & hls_videos). If we already parsed this video's
                 // segments before, we can build the manifest straight from the DB and
-                // skip the origin server entirely — no /api/stream call, no re-fetching
-                // the source .m3u8. This is the fix for the "refetches on every switch"
-                // bug: previously the origin call happened unconditionally, before this
-                // cache check, so EVERY request re-hit the host server even when the
-                // master was already cached.
+                // skip the origin server entirely.
                 let videoRecord = null;
                 if (db) {
                     try {
-                        const stmt = db.prepare('SELECT * FROM hls_videos WHERE filecode = ?').bind(filecode);
-                        const { results } = await stmt.all();
-                        videoRecord = results && results.length > 0 ? results[0] : null;
+                        const directRow = await db.prepare('SELECT target_duration, segments_json FROM external_direct_links WHERE filecode = ? AND segments_json IS NOT NULL').bind(filecode).first();
+                        if (directRow && directRow.segments_json) {
+                            videoRecord = directRow;
+                        }
                     } catch (e) {
-                        console.error('[custom-hls] SELECT failed:', e.message);
-                        videoRecord = null; // degrade to cache-miss instead of crashing
+                        console.error('[custom-hls] external_direct_links SELECT failed:', e.message);
+                    }
+
+                    if (!videoRecord) {
+                        try {
+                            const hlsRow = await db.prepare('SELECT target_duration, segments_json FROM hls_videos WHERE filecode = ? AND segments_json IS NOT NULL').bind(filecode).first();
+                            if (hlsRow && hlsRow.segments_json) {
+                                videoRecord = hlsRow;
+                            }
+                        } catch (e) {
+                            console.error('[custom-hls] hls_videos SELECT failed:', e.message);
+                        }
                     }
                 }
 
@@ -417,12 +424,17 @@ export default {
                     if (segments.length === 0) throw new Error("No segments found");
 
                     const segmentsJson = JSON.stringify(compressSegments(segments));
+                    const calculatedCustomHlsUrl = `${url.origin}/api/custom-hls/${filecode}.m3u8?domain=${encodeURIComponent(domain)}`;
                     
-                    // Step 3: Insert location data into DB. UPSERT (not INSERT OR REPLACE)
-                    // so this only touches the segment columns — getStreamData may already
-                    // have written title/thumbnail/subtitles_json/streaming_url on this same
-                    // row, and REPLACE would have wiped them back to NULL. Wrapped so a
-                    // schema issue here logs instead of breaking manifest serving below.
+                    // Step 3: Insert location data into DB (both external_direct_links and hls_videos)
+                    try {
+                        await db.prepare(
+                            `UPDATE external_direct_links SET target_duration = ?, segments_json = ?, custom_hls_url = ?, updated_at = ? WHERE filecode = ?`
+                        ).bind(targetDuration, segmentsJson, calculatedCustomHlsUrl, Date.now(), filecode).run();
+                    } catch (e) {
+                        // ignore if table or row doesn't exist yet
+                    }
+
                     try {
                         await db.prepare(
                             `INSERT INTO hls_videos (filecode, target_duration, segments_json, updated_at)
@@ -641,7 +653,8 @@ export default {
         //   CREATE TABLE IF NOT EXISTS external_direct_links (
         //     link_hash TEXT PRIMARY KEY, original_url TEXT, domain TEXT,
         //     filecode TEXT, title TEXT, thumbnail TEXT, subtitles_json TEXT,
-        //     streaming_url TEXT, custom_hls_url TEXT, created_at INTEGER, updated_at INTEGER
+        //     streaming_url TEXT, custom_hls_url TEXT, target_duration INTEGER,
+        //     segments_json TEXT, created_at INTEGER, updated_at INTEGER
         //   );
         // If tables already exist in a different shape, run
         // `PRAGMA table_info(table_name);` and add whatever's missing with `ALTER TABLE ... ADD COLUMN ...`.
@@ -686,10 +699,12 @@ export default {
             }
         }
 
-        async function getDirectLinkData(directInfo, env, ctx) {
+        async function getDirectLinkData(directInfo, env, ctx, appOrigin) {
             const db = env.DB;
             const kv = env.VIDARA_KV;
             const { domain, fileCode, originalUrl, linkHash, isVidaraV, videoId } = directInfo;
+            const originBase = appOrigin || '';
+            const calculatedCustomHlsUrl = `${originBase}/api/custom-hls/${fileCode}.m3u8?domain=${encodeURIComponent(domain)}`;
 
             // If vidara.so/v/ID link is passed, resolve via backend if available
             if (isVidaraV && videoId) {
@@ -701,6 +716,7 @@ export default {
                             thumbnail: vData.thumbnail || '',
                             vtt: vData.vtt || vData.thumbnails || vData.storyboard || '',
                             links: vData.links,
+                            custom_hls_url: calculatedCustomHlsUrl,
                             isDirect: true
                         };
                     }
@@ -712,16 +728,18 @@ export default {
             // 1. Check external_direct_links table in D1 (if bound)
             if (db) {
                 const row = await safeDbRead(db.prepare(
-                    'SELECT title, thumbnail, subtitles_json, streaming_url, custom_hls_url FROM external_direct_links WHERE link_hash = ?'
-                ).bind(linkHash).first(), 'external_direct_links SELECT link_hash=' + linkHash);
+                    'SELECT title, thumbnail, subtitles_json, streaming_url, custom_hls_url, target_duration, segments_json FROM external_direct_links WHERE link_hash = ? OR filecode = ?'
+                ).bind(linkHash, fileCode).first(), 'external_direct_links SELECT link_hash=' + linkHash);
 
-                if (row && row.streaming_url) {
+                if (row && (row.streaming_url || row.custom_hls_url)) {
                     return {
                         title: row.title || `Video (${fileCode})`,
                         thumbnail: row.thumbnail || '',
                         subtitles: row.subtitles_json ? JSON.parse(row.subtitles_json) : [],
-                        streaming_url: row.streaming_url,
-                        custom_hls_url: row.custom_hls_url || null,
+                        streaming_url: row.streaming_url || '',
+                        custom_hls_url: row.custom_hls_url || calculatedCustomHlsUrl,
+                        target_duration: row.target_duration || 10,
+                        segments_json: row.segments_json || null,
                         domain: domain,
                         filecode: fileCode,
                         original_url: originalUrl,
@@ -731,7 +749,11 @@ export default {
             } else if (kv) {
                 const cached = await kv.get('direct:' + linkHash);
                 if (cached) {
-                    try { return JSON.parse(cached); } catch (e) {}
+                    try {
+                        const parsed = JSON.parse(cached);
+                        if (!parsed.custom_hls_url) parsed.custom_hls_url = calculatedCustomHlsUrl;
+                        return parsed;
+                    } catch (e) {}
                 }
             }
 
@@ -755,6 +777,7 @@ export default {
                 thumbnail: (streamData && streamData.thumbnail) || '',
                 subtitles: (streamData && Array.isArray(streamData.subtitles)) ? streamData.subtitles : [],
                 streaming_url: (streamData && streamData.streaming_url) || '',
+                custom_hls_url: calculatedCustomHlsUrl,
                 domain: domain,
                 filecode: fileCode,
                 original_url: originalUrl,
@@ -762,10 +785,10 @@ export default {
             };
 
             // 3. Save into separate external_direct_links table asynchronously
-            if (db && result.streaming_url) {
+            if (db && (result.streaming_url || result.custom_hls_url)) {
                 ctx.waitUntil(safeDbWrite(db.prepare(
-                    `INSERT INTO external_direct_links (link_hash, original_url, domain, filecode, title, thumbnail, subtitles_json, streaming_url, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    `INSERT INTO external_direct_links (link_hash, original_url, domain, filecode, title, thumbnail, subtitles_json, streaming_url, custom_hls_url, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(link_hash) DO UPDATE SET
                         original_url = excluded.original_url,
                         domain = excluded.domain,
@@ -774,6 +797,7 @@ export default {
                         thumbnail = excluded.thumbnail,
                         subtitles_json = excluded.subtitles_json,
                         streaming_url = excluded.streaming_url,
+                        custom_hls_url = excluded.custom_hls_url,
                         updated_at = excluded.updated_at`
                 ).bind(
                     linkHash,
@@ -784,6 +808,7 @@ export default {
                     result.thumbnail,
                     JSON.stringify(result.subtitles),
                     result.streaming_url,
+                    result.custom_hls_url,
                     Date.now(),
                     Date.now()
                 ).run(), 'external_direct_links INSERT link_hash=' + linkHash));
@@ -1132,7 +1157,7 @@ export default {
 
             if (directInfo) {
                 // Process direct link directly without requiring database or onrender.com lookup
-                const directData = await getDirectLinkData(directInfo, env, ctx);
+                const directData = await getDirectLinkData(directInfo, env, ctx, url.origin);
                 posterUrl = directData.thumbnail || '';
                 thumbnailsUrl = directData.vtt || '';
                 apiData = {
@@ -1143,7 +1168,7 @@ export default {
                 };
 
                 const directEmbedUrl = `${directInfo.domain}/e/${directInfo.fileCode}`;
-                const customHlsUrl = `${url.origin}/api/custom-hls/${directInfo.fileCode}.m3u8?domain=${encodeURIComponent(directInfo.domain)}`;
+                const customHlsUrl = directData.custom_hls_url || `${url.origin}/api/custom-hls/${directInfo.fileCode}.m3u8?domain=${encodeURIComponent(directInfo.domain)}`;
 
                 const subs = Array.isArray(directData.subtitles)
                     ? directData.subtitles.map(function (s) { return { url: s.file_path || s.url, language: s.language || 'Unknown' }; }).filter(function (s) { return !!s.url; })
