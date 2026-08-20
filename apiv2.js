@@ -1,6 +1,3 @@
---6e78f10f866182f9a0800b5acbd55317a5c12332c6d539b0195c10467b88
-Content-Disposition: form-data; name="worker.js"
-
 export default {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
@@ -3426,5 +3423,3 @@ export default {
         }
     }
 }
-
---6e78f10f866182f9a0800b5acbd55317a5c12332c6d539b0195c10467b88--
