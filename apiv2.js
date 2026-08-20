@@ -1037,8 +1037,52 @@ export default {
             directInfo = parseDirectLink(videoId);
         }
 
-        if (request.method !== 'GET' || (!videoId && !directInfo) || videoId === 'favicon.ico' || videoId === 'api') {
+        if (request.method !== 'GET' || videoId === 'favicon.ico' || videoId === 'api') {
             return new Response('Not Found', { status: 404 });
+        }
+
+        if (!videoId && !directInfo) {
+            const rootHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stream Player & API</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+        .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; max-width: 580px; width: 100%; padding: 32px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+        h1 { font-size: 22px; font-weight: 700; margin-bottom: 12px; color: #38bdf8; }
+        p { font-size: 14px; color: #94a3b8; line-height: 1.5; margin-bottom: 24px; }
+        .input-group { display: flex; gap: 8px; margin-bottom: 24px; }
+        input { flex: 1; padding: 12px 16px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #fff; font-size: 14px; outline: none; }
+        input:focus { border-color: #38bdf8; }
+        button { background: #0284c7; color: #fff; border: none; border-radius: 8px; padding: 12px 20px; font-weight: 600; cursor: pointer; transition: 0.2s; }
+        button:hover { background: #0369a1; }
+        .examples { border-top: 1px solid #334155; padding-top: 18px; font-size: 13px; color: #64748b; }
+        .examples code { display: block; background: #0f172a; color: #38bdf8; padding: 8px 12px; border-radius: 6px; margin-top: 6px; word-break: break-all; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Direct Stream Player</h1>
+        <p>যেকোনো সাপোর্টেড ডোমেইন বা vidara লিংক দিয়ে সরাসরি ভিডিও প্লে করুন বা এপিআই কল করুন।</p>
+        <form onsubmit="event.preventDefault(); const val = document.getElementById('urlInput').value.trim(); if(val) window.location.href = '/?url=' + encodeURIComponent(val);">
+            <div class="input-group">
+                <input id="urlInput" type="text" placeholder="https://vidara.so/e/xxxxxx" required />
+                <button type="submit">Play</button>
+            </div>
+        </form>
+        <div class="examples">
+            <div>URL Parameter Format:</div>
+            <code>${url.origin}/?url=https://vidara.so/e/FILECODE</code>
+            <div style="margin-top: 10px;">JSON API Format:</div>
+            <code>${url.origin}/?url=https://vidara.so/e/FILECODE&format=json</code>
+        </div>
+    </div>
+</body>
+</html>`;
+            return new Response(rootHtml, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
         }
 
         if (directInfo) {
