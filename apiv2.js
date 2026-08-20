@@ -294,7 +294,7 @@ export default {
                 for (let i = 0; i < parsed.count; i++) {
                     const file = parsed.prefix + String(i).padStart(parsed.pad, '0') + parsed.ext;
                     out.push({
-                        duration: parsed.e[i] !== undefined ? parsed.e[i] : parsed.d,
+                        duration: (parsed.e && parsed.e[i] !== undefined) ? parsed.e[i] : parsed.d,
                         url: parsed.base ? parsed.base + file : file
                     });
                 }
@@ -302,10 +302,76 @@ export default {
             }
             return parsed.f.map(function (file, i) {  // older f-array format
                 return {
-                    duration: parsed.e[i] !== undefined ? parsed.e[i] : parsed.d,
+                    duration: (parsed.e && parsed.e[i] !== undefined) ? parsed.e[i] : parsed.d,
                     url: parsed.base ? parsed.base + file : file
                 };
             });
+        }
+
+        async function parseAndCompressM3u8(streamingUrl) {
+            if (!streamingUrl) return null;
+            try {
+                const m3u8Resp = await fetch(streamingUrl);
+                if (!m3u8Resp.ok) return null;
+                const text = await m3u8Resp.text();
+
+                let indexText = text;
+                let baseUrl = streamingUrl.substring(0, streamingUrl.lastIndexOf('/') + 1);
+
+                // If Master Playlist, resolve to first Index Playlist
+                if (text.includes('#EXT-X-STREAM-INF')) {
+                    const lines = text.split('\n');
+                    let nextLineIsIndex = false;
+                    for (let line of lines) {
+                        if (line.startsWith('#EXT-X-STREAM-INF')) {
+                            nextLineIsIndex = true;
+                        } else if (nextLineIsIndex && line.trim() && !line.startsWith('#')) {
+                            const indexUrl = line.trim().startsWith('http') ? line.trim() : baseUrl + line.trim();
+                            const indexResp = await fetch(indexUrl);
+                            if (indexResp.ok) {
+                                indexText = await indexResp.text();
+                                baseUrl = indexUrl.substring(0, indexUrl.lastIndexOf('/') + 1);
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                // Parse Segments
+                const lines = indexText.split('\n');
+                let segments = [];
+                let currentDuration = 0;
+                let targetDuration = 10;
+
+                for (let line of lines) {
+                    line = line.trim();
+                    if (!line) continue;
+
+                    if (line.startsWith('#EXT-X-TARGETDURATION:')) {
+                        targetDuration = parseInt(line.split(':')[1], 10);
+                    } else if (line.startsWith('#EXTINF:')) {
+                        currentDuration = parseFloat(line.split(':')[1].split(',')[0]);
+                    } else if (line.endsWith('.ts') || line.includes('.ts?')) {
+                        const directSegmentUrl = line.startsWith('http') ? line : baseUrl + line;
+                        const cleanSegmentUrl = directSegmentUrl.split('?')[0]; // Strip token
+                        segments.push({
+                            duration: currentDuration,
+                            url: cleanSegmentUrl
+                        });
+                    }
+                }
+
+                if (segments.length === 0) return null;
+                const compressed = compressSegments(segments);
+                return {
+                    targetDuration: targetDuration || 10,
+                    segmentsJson: JSON.stringify(compressed),
+                    segmentsCount: segments.length
+                };
+            } catch (e) {
+                console.error('[parseAndCompressM3u8 failed]:', e.message);
+                return null;
+            }
         }
 
         // ==============================================================================
@@ -372,58 +438,12 @@ export default {
                     // SILENT FALLBACK: If user hasn't bound the DB, redirect to original stream seamlessly
                     if (!db) return Response.redirect(originalStreamingUrl, 302);
 
-                    const m3u8Resp = await fetch(originalStreamingUrl);
-                    if (!m3u8Resp.ok) throw new Error("Failed to fetch original HLS");
-                    const text = await m3u8Resp.text();
+                    // Fetch and parse segments into compressed format
+                    const parsedM3u8 = await parseAndCompressM3u8(originalStreamingUrl);
+                    if (!parsedM3u8 || !parsedM3u8.segmentsJson) throw new Error("No segments found in m3u8 playlist");
 
-                    let indexText = text;
-                    let baseUrl = originalStreamingUrl.substring(0, originalStreamingUrl.lastIndexOf('/') + 1);
-
-                    // If it's a Master Playlist, resolve to the first Index Playlist
-                    if (text.includes('#EXT-X-STREAM-INF')) {
-                        const lines = text.split('\n');
-                        let nextLineIsIndex = false;
-                        for (let line of lines) {
-                            if (line.startsWith('#EXT-X-STREAM-INF')) {
-                                nextLineIsIndex = true;
-                            } else if (nextLineIsIndex && line.trim() && !line.startsWith('#')) {
-                                const indexUrl = line.trim().startsWith('http') ? line.trim() : baseUrl + line.trim();
-                                const indexResp = await fetch(indexUrl);
-                                indexText = await indexResp.text();
-                                baseUrl = indexUrl.substring(0, indexUrl.lastIndexOf('/') + 1);
-                                break;
-                            }
-                        }
-                    }
-
-                    // Parse Segments
-                    const lines = indexText.split('\n');
-                    let segments = [];
-                    let currentDuration = 0;
-                    let targetDuration = 10;
-                    
-                    for (let line of lines) {
-                        line = line.trim();
-                        if (!line) continue;
-                        
-                        if (line.startsWith('#EXT-X-TARGETDURATION:')) {
-                            targetDuration = parseInt(line.split(':')[1], 10);
-                        } else if (line.startsWith('#EXTINF:')) {
-                            currentDuration = parseFloat(line.split(':')[1].split(',')[0]);
-                        } else if (line.endsWith('.ts') || line.includes('.ts?')) {
-                            const directSegmentUrl = line.startsWith('http') ? line : baseUrl + line;
-                            const cleanSegmentUrl = directSegmentUrl.split('?')[0]; // Removing token!
-                            
-                            segments.push({
-                                duration: currentDuration,
-                                url: cleanSegmentUrl
-                            });
-                        }
-                    }
-
-                    if (segments.length === 0) throw new Error("No segments found");
-
-                    const segmentsJson = JSON.stringify(compressSegments(segments));
+                    const targetDuration = parsedM3u8.targetDuration || 10;
+                    const segmentsJson = parsedM3u8.segmentsJson;
                     const calculatedCustomHlsUrl = `${url.origin}/api/custom-hls/${filecode}.m3u8?domain=${encodeURIComponent(domain)}`;
                     
                     // Step 3: Insert location data into DB (both external_direct_links and hls_videos)
@@ -772,12 +792,19 @@ export default {
                 console.error('[direct /api/stream fetch failed]:', e.message);
             }
 
+            let parsedSegments = null;
+            if (streamData && streamData.streaming_url) {
+                parsedSegments = await parseAndCompressM3u8(streamData.streaming_url);
+            }
+
             const result = {
                 title: (streamData && streamData.title) || `Video (${fileCode})`,
                 thumbnail: (streamData && streamData.thumbnail) || '',
                 subtitles: (streamData && Array.isArray(streamData.subtitles)) ? streamData.subtitles : [],
                 streaming_url: (streamData && streamData.streaming_url) || '',
                 custom_hls_url: calculatedCustomHlsUrl,
+                target_duration: (parsedSegments && parsedSegments.targetDuration) || 10,
+                segments_json: (parsedSegments && parsedSegments.segmentsJson) || null,
                 domain: domain,
                 filecode: fileCode,
                 original_url: originalUrl,
@@ -787,8 +814,8 @@ export default {
             // 3. Save into separate external_direct_links table asynchronously
             if (db && (result.streaming_url || result.custom_hls_url)) {
                 ctx.waitUntil(safeDbWrite(db.prepare(
-                    `INSERT INTO external_direct_links (link_hash, original_url, domain, filecode, title, thumbnail, subtitles_json, streaming_url, custom_hls_url, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    `INSERT INTO external_direct_links (link_hash, original_url, domain, filecode, title, thumbnail, subtitles_json, streaming_url, custom_hls_url, target_duration, segments_json, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(link_hash) DO UPDATE SET
                         original_url = excluded.original_url,
                         domain = excluded.domain,
@@ -798,6 +825,8 @@ export default {
                         subtitles_json = excluded.subtitles_json,
                         streaming_url = excluded.streaming_url,
                         custom_hls_url = excluded.custom_hls_url,
+                        target_duration = excluded.target_duration,
+                        segments_json = excluded.segments_json,
                         updated_at = excluded.updated_at`
                 ).bind(
                     linkHash,
@@ -809,6 +838,8 @@ export default {
                     JSON.stringify(result.subtitles),
                     result.streaming_url,
                     result.custom_hls_url,
+                    result.target_duration,
+                    result.segments_json,
                     Date.now(),
                     Date.now()
                 ).run(), 'external_direct_links INSERT link_hash=' + linkHash));
@@ -885,15 +916,27 @@ export default {
             const data = streamResp.ok ? await streamResp.json() : null;
 
             if (data) {
+                let parsedSegments = null;
+                if (data.streaming_url) {
+                    try {
+                        parsedSegments = await parseAndCompressM3u8(data.streaming_url);
+                    } catch (e) {}
+                }
+
                 if (db) {
+                    const targetDur = (parsedSegments && parsedSegments.targetDuration) || null;
+                    const segsJson = (parsedSegments && parsedSegments.segmentsJson) || null;
+
                     ctx.waitUntil(safeDbWrite(db.prepare(
-                        `INSERT INTO hls_videos (filecode, title, thumbnail, subtitles_json, streaming_url, updated_at)
-                         VALUES (?, ?, ?, ?, ?, ?)
+                        `INSERT INTO hls_videos (filecode, title, thumbnail, subtitles_json, streaming_url, target_duration, segments_json, updated_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                          ON CONFLICT(filecode) DO UPDATE SET
                             title = excluded.title, thumbnail = excluded.thumbnail,
                             subtitles_json = excluded.subtitles_json, streaming_url = excluded.streaming_url,
+                            target_duration = COALESCE(excluded.target_duration, hls_videos.target_duration),
+                            segments_json = COALESCE(excluded.segments_json, hls_videos.segments_json),
                             updated_at = excluded.updated_at`
-                    ).bind(fileCode, data.title || null, data.thumbnail || null, JSON.stringify(data.subtitles || []), data.streaming_url || null, Date.now()).run(),
+                    ).bind(fileCode, data.title || null, data.thumbnail || null, JSON.stringify(data.subtitles || []), data.streaming_url || null, targetDur, segsJson, Date.now()).run(),
                     'hls_videos INSERT filecode=' + fileCode));
                 } else if (kv) {
                     ctx.waitUntil(kv.put('stream:' + domain + ':' + fileCode, JSON.stringify(data), { expirationTtl: 240 }));
