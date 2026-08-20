@@ -641,15 +641,160 @@ export default {
         //     subtitles_json TEXT, streaming_url TEXT,
         //     target_duration INTEGER, segments_json TEXT, updated_at INTEGER
         //   );
-        // If either table already exists in a different shape, run
-        // `PRAGMA table_info(video_meta);` / `PRAGMA table_info(hls_videos);` and add
-        // whatever's missing with `ALTER TABLE ... ADD COLUMN ...`.
+        //   CREATE TABLE IF NOT EXISTS external_direct_links (
+        //     link_hash TEXT PRIMARY KEY, original_url TEXT, domain TEXT,
+        //     filecode TEXT, title TEXT, thumbnail TEXT, subtitles_json TEXT,
+        //     streaming_url TEXT, custom_hls_url TEXT, created_at INTEGER, updated_at INTEGER
+        //   );
+        // If tables already exist in a different shape, run
+        // `PRAGMA table_info(table_name);` and add whatever's missing with `ALTER TABLE ... ADD COLUMN ...`.
 
         async function safeDbRead(promise, label) {
             try { return await promise; } catch (e) { console.error('[db read failed] ' + label + ':', e.message); return null; }
         }
         function safeDbWrite(promise, label) {
             return promise.catch(function (e) { console.error('[db write failed] ' + label + ':', e.message); });
+        }
+
+        function parseDirectLink(inputUrl) {
+            if (!inputUrl || typeof inputUrl !== 'string') return null;
+            try {
+                let clean = inputUrl.trim();
+                if (clean.includes('%3A%2F%2F') || clean.includes('%2F')) {
+                    try { clean = decodeURIComponent(clean); } catch (e) {}
+                }
+                if (!clean.startsWith('http://') && !clean.startsWith('https://')) {
+                    if (clean.includes('.') || clean.startsWith('vidara')) {
+                        clean = 'https://' + clean;
+                    } else {
+                        return null;
+                    }
+                }
+                const u = new URL(clean);
+                const domain = u.origin;
+                const parts = u.pathname.split('/').filter(Boolean);
+                if (parts.length === 0) return null;
+                const fileCode = parts[parts.length - 1].replace(/\.(m3u8|mp4|html)$/i, '');
+                const isVidaraV = (domain.includes('vidara.so') || domain.includes('vidara')) && parts.includes('v');
+                return {
+                    domain,
+                    fileCode,
+                    originalUrl: clean,
+                    linkHash: `${domain}:${fileCode}`,
+                    isVidaraV,
+                    videoId: isVidaraV ? fileCode : null
+                };
+            } catch (e) {
+                return null;
+            }
+        }
+
+        async function getDirectLinkData(directInfo, env, ctx) {
+            const db = env.DB;
+            const kv = env.VIDARA_KV;
+            const { domain, fileCode, originalUrl, linkHash, isVidaraV, videoId } = directInfo;
+
+            // If vidara.so/v/ID link is passed, resolve via backend if available
+            if (isVidaraV && videoId) {
+                try {
+                    const vData = await getVideoMetadata(videoId, env, ctx);
+                    if (vData && vData.links && vData.links.length > 0) {
+                        return {
+                            title: vData.title || `Video ${videoId}`,
+                            thumbnail: vData.thumbnail || '',
+                            vtt: vData.vtt || vData.thumbnails || vData.storyboard || '',
+                            links: vData.links,
+                            isDirect: true
+                        };
+                    }
+                } catch (e) {
+                    console.error('[direct vidara.so/v/] fetch error:', e.message);
+                }
+            }
+
+            // 1. Check external_direct_links table in D1 (if bound)
+            if (db) {
+                const row = await safeDbRead(db.prepare(
+                    'SELECT title, thumbnail, subtitles_json, streaming_url, custom_hls_url FROM external_direct_links WHERE link_hash = ?'
+                ).bind(linkHash).first(), 'external_direct_links SELECT link_hash=' + linkHash);
+
+                if (row && row.streaming_url) {
+                    return {
+                        title: row.title || `Video (${fileCode})`,
+                        thumbnail: row.thumbnail || '',
+                        subtitles: row.subtitles_json ? JSON.parse(row.subtitles_json) : [],
+                        streaming_url: row.streaming_url,
+                        custom_hls_url: row.custom_hls_url || null,
+                        domain: domain,
+                        filecode: fileCode,
+                        original_url: originalUrl,
+                        isDirect: true
+                    };
+                }
+            } else if (kv) {
+                const cached = await kv.get('direct:' + linkHash);
+                if (cached) {
+                    try { return JSON.parse(cached); } catch (e) {}
+                }
+            }
+
+            // 2. Direct origin fetch — NO DATABASE REQUIRED (Database-free processing)
+            let streamData = null;
+            try {
+                const streamResp = await fetch(`${domain}/api/stream`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filecode: fileCode, device: 'web' })
+                });
+                if (streamResp.ok) {
+                    streamData = await streamResp.json();
+                }
+            } catch (e) {
+                console.error('[direct /api/stream fetch failed]:', e.message);
+            }
+
+            const result = {
+                title: (streamData && streamData.title) || `Video (${fileCode})`,
+                thumbnail: (streamData && streamData.thumbnail) || '',
+                subtitles: (streamData && Array.isArray(streamData.subtitles)) ? streamData.subtitles : [],
+                streaming_url: (streamData && streamData.streaming_url) || '',
+                domain: domain,
+                filecode: fileCode,
+                original_url: originalUrl,
+                isDirect: true
+            };
+
+            // 3. Save into separate external_direct_links table asynchronously
+            if (db && result.streaming_url) {
+                ctx.waitUntil(safeDbWrite(db.prepare(
+                    `INSERT INTO external_direct_links (link_hash, original_url, domain, filecode, title, thumbnail, subtitles_json, streaming_url, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(link_hash) DO UPDATE SET
+                        original_url = excluded.original_url,
+                        domain = excluded.domain,
+                        filecode = excluded.filecode,
+                        title = excluded.title,
+                        thumbnail = excluded.thumbnail,
+                        subtitles_json = excluded.subtitles_json,
+                        streaming_url = excluded.streaming_url,
+                        updated_at = excluded.updated_at`
+                ).bind(
+                    linkHash,
+                    originalUrl,
+                    domain,
+                    fileCode,
+                    result.title,
+                    result.thumbnail,
+                    JSON.stringify(result.subtitles),
+                    result.streaming_url,
+                    Date.now(),
+                    Date.now()
+                ).run(), 'external_direct_links INSERT link_hash=' + linkHash));
+            } else if (kv && result.streaming_url) {
+                ctx.waitUntil(kv.put('direct:' + linkHash, JSON.stringify(result), { expirationTtl: 300 }));
+            }
+
+            return result;
         }
 
         async function getVideoMetadata(videoId, env, ctx) {
@@ -875,16 +1020,34 @@ export default {
         // ==============================================================================
         // 5. Main Player Page Generator
         // ==============================================================================
-        const pathSegments = url.pathname.split('/').filter(Boolean);
-        const videoId = pathSegments.pop();
+        const directParam = url.searchParams.get('url') || url.searchParams.get('link') || url.searchParams.get('direct');
+        let directInfo = directParam ? parseDirectLink(directParam) : null;
+        if (!directInfo && url.pathname.startsWith('/direct')) {
+            const rawAfterDirect = url.pathname.replace(/^\/direct\/?/, '');
+            if (rawAfterDirect) directInfo = parseDirectLink(rawAfterDirect);
+        }
+        if (!directInfo && url.pathname.startsWith('/e/')) {
+            const dom = url.searchParams.get('domain') || 'https://vidara.so';
+            directInfo = parseDirectLink(dom + url.pathname);
+        }
 
-        if (request.method !== 'GET' || !videoId || videoId === 'favicon.ico' || videoId === 'api') {
+        const pathSegments = url.pathname.split('/').filter(Boolean);
+        let videoId = pathSegments.pop();
+        if (!directInfo && videoId && (videoId.startsWith('http://') || videoId.startsWith('https://') || videoId.includes('.'))) {
+            directInfo = parseDirectLink(videoId);
+        }
+
+        if (request.method !== 'GET' || (!videoId && !directInfo) || videoId === 'favicon.ico' || videoId === 'api') {
             return new Response('Not Found', { status: 404 });
+        }
+
+        if (directInfo) {
+            videoId = directInfo.fileCode;
         }
 
         // Ad-gate check: no valid token for THIS video from THIS IP -> bounce to /verify/:id.
         // Skipped entirely while AD_GATE_SECRET is unset (see note above).
-        if (env.AD_GATE_SECRET) {
+        if (env.AD_GATE_SECRET && videoId) {
             const incomingToken = url.searchParams.get('token');
             const tokenOk = await verifyAccessToken(incomingToken, videoId, clientIP, env.AD_GATE_SECRET);
             if (!tokenOk) {
@@ -921,72 +1084,129 @@ export default {
         }
 
         try {
-            // Fetch video metadata (shared D1 cache with /verify — see getVideoMetadata above)
-            const apiData = await getVideoMetadata(videoId, env, ctx);
-
-            const posterUrl = apiData.thumbnail || '';
-            const thumbnailsUrl = apiData.vtt || apiData.thumbnails || apiData.storyboard || '';
-            const rawLinks = apiData.links || [];
+            let apiData = null;
+            let posterUrl = '';
+            let thumbnailsUrl = '';
             let sources = [];
 
-            // Process Links
-            for (let i = 0; i < rawLinks.length; i++) {
-                const cleanLink = rawLinks[i].replace(/[^a-zA-Z0-9:/\.\-_]/g, '');
+            if (directInfo) {
+                // Process direct link directly without requiring database or onrender.com lookup
+                const directData = await getDirectLinkData(directInfo, env, ctx);
+                posterUrl = directData.thumbnail || '';
+                thumbnailsUrl = directData.vtt || '';
+                apiData = {
+                    title: directData.title || `Video (${directInfo.fileCode})`,
+                    thumbnail: posterUrl,
+                    vtt: thumbnailsUrl,
+                    links: [directInfo.originalUrl]
+                };
 
-                try {
-                    const linkUrlObj = new URL(cleanLink);
-                    const domain = linkUrlObj.origin;
-                    const fileCode = linkUrlObj.pathname.split('/').pop();
-                    const directEmbedUrl = `${domain}/e/${fileCode}`;
+                const directEmbedUrl = `${directInfo.domain}/e/${directInfo.fileCode}`;
+                const customHlsUrl = `${url.origin}/api/custom-hls/${directInfo.fileCode}.m3u8?domain=${encodeURIComponent(directInfo.domain)}`;
 
-                    const customHlsUrl = `${url.origin}/api/custom-hls/${fileCode}.m3u8?domain=${encodeURIComponent(domain)}`;
+                const subs = Array.isArray(directData.subtitles)
+                    ? directData.subtitles.map(function (s) { return { url: s.file_path || s.url, language: s.language || 'Unknown' }; }).filter(function (s) { return !!s.url; })
+                    : [];
 
-                    const streamJson = await getStreamData(domain, fileCode, env, ctx);
-
-                    if (streamJson) {
-                        if (streamJson.streaming_url) {
-                            // The origin's /api/stream response can include a `subtitles`
-                            // array (file_path + language per track) — previously this was
-                            // fetched and silently discarded. Now it rides along on the
-                            // source object so the player can offer subtitle tracks.
-                            const subs = Array.isArray(streamJson.subtitles)
-                                ? streamJson.subtitles.map(function (s) { return { url: s.file_path, language: s.language || 'Unknown' }; }).filter(function (s) { return !!s.url; })
-                                : [];
-
-                            // PRIMARY: Add our Custom Bypassed URL first
-                            sources.push({
-                                html: `Source ${i + 1} (Direct Stream - Fast)`,
-                                url: customHlsUrl,
-                                isEmbed: false,
-                                filecode: fileCode,
-                                domain: domain,
-                                subtitles: subs,
-                                thumbnail: streamJson.thumbnail || posterUrl
-                            });
-
-                            // BACKUP: Add original API stream link just in case
-                            sources.push({
-                                html: `Source ${i + 1} (Backup Stream)`,
-                                url: streamJson.streaming_url,
-                                isEmbed: false,
-                                filecode: fileCode,
-                                domain: domain,
-                                subtitles: subs,
-                                thumbnail: streamJson.thumbnail || posterUrl
-                            });
-                        }
-                    }
-
+                if (directData.streaming_url) {
+                    // PRIMARY: Custom Bypassed URL
                     sources.push({
-                        html: `Source ${i + 1} (Embed Fallback)`,
-                        url: directEmbedUrl,
-                        isEmbed: true,
-                        filecode: fileCode,
-                        domain: domain
+                        html: `Direct Source (Fast Stream)`,
+                        url: customHlsUrl,
+                        isEmbed: false,
+                        filecode: directInfo.fileCode,
+                        domain: directInfo.domain,
+                        subtitles: subs,
+                        thumbnail: directData.thumbnail || posterUrl
                     });
 
-                } catch (e) {
-                    console.error("Link parsing error:", e);
+                    // BACKUP: Original direct streaming URL
+                    sources.push({
+                        html: `Direct Source (Backup Stream)`,
+                        url: directData.streaming_url,
+                        isEmbed: false,
+                        filecode: directInfo.fileCode,
+                        domain: directInfo.domain,
+                        subtitles: subs,
+                        thumbnail: directData.thumbnail || posterUrl
+                    });
+                }
+
+                // FALLBACK: Direct embed page
+                sources.push({
+                    html: `Direct Source (Embed Fallback)`,
+                    url: directEmbedUrl,
+                    isEmbed: true,
+                    filecode: directInfo.fileCode,
+                    domain: directInfo.domain
+                });
+            } else {
+                // Fetch video metadata (shared D1 cache with /verify — see getVideoMetadata above)
+                apiData = await getVideoMetadata(videoId, env, ctx);
+
+                posterUrl = apiData.thumbnail || '';
+                thumbnailsUrl = apiData.vtt || apiData.thumbnails || apiData.storyboard || '';
+                const rawLinks = apiData.links || [];
+
+                // Process Links
+                for (let i = 0; i < rawLinks.length; i++) {
+                    const cleanLink = rawLinks[i].replace(/[^a-zA-Z0-9:/\.\-_]/g, '');
+
+                    try {
+                        const linkUrlObj = new URL(cleanLink);
+                        const domain = linkUrlObj.origin;
+                        const fileCode = linkUrlObj.pathname.split('/').pop();
+                        const directEmbedUrl = `${domain}/e/${fileCode}`;
+
+                        const customHlsUrl = `${url.origin}/api/custom-hls/${fileCode}.m3u8?domain=${encodeURIComponent(domain)}`;
+
+                        const streamJson = await getStreamData(domain, fileCode, env, ctx);
+
+                        if (streamJson) {
+                            if (streamJson.streaming_url) {
+                                // The origin's /api/stream response can include a `subtitles`
+                                // array (file_path + language per track) — previously this was
+                                // fetched and silently discarded. Now it rides along on the
+                                // source object so the player can offer subtitle tracks.
+                                const subs = Array.isArray(streamJson.subtitles)
+                                    ? streamJson.subtitles.map(function (s) { return { url: s.file_path, language: s.language || 'Unknown' }; }).filter(function (s) { return !!s.url; })
+                                    : [];
+
+                                // PRIMARY: Add our Custom Bypassed URL first
+                                sources.push({
+                                    html: `Source ${i + 1} (Direct Stream - Fast)`,
+                                    url: customHlsUrl,
+                                    isEmbed: false,
+                                    filecode: fileCode,
+                                    domain: domain,
+                                    subtitles: subs,
+                                    thumbnail: streamJson.thumbnail || posterUrl
+                                });
+
+                                // BACKUP: Add original API stream link just in case
+                                sources.push({
+                                    html: `Source ${i + 1} (Backup Stream)`,
+                                    url: streamJson.streaming_url,
+                                    isEmbed: false,
+                                    filecode: fileCode,
+                                    domain: domain,
+                                    subtitles: subs,
+                                    thumbnail: streamJson.thumbnail || posterUrl
+                                });
+                            }
+                        }
+
+                        sources.push({
+                            html: `Source ${i + 1} (Embed Fallback)`,
+                            url: directEmbedUrl,
+                            isEmbed: true,
+                            filecode: fileCode,
+                            domain: domain
+                        });
+
+                    } catch (e) {
+                        console.error("Link parsing error:", e);
+                    }
                 }
             }
 
